@@ -1,0 +1,612 @@
+#!/usr/bin/env bash
+#
+# mac-tune — clean up and tune macOS for a Docker + browser + IDE workflow.
+# Safe to run while you work, and safe to run again.
+#
+#   mac-tune                    safe defaults: diagnostics, orphaned helper
+#                               processes, Spotlight markers, old logs
+#   mac-tune -n                 dry run: show what would change, change nothing
+#   mac-tune --diag             diagnostics only
+#   mac-tune --claude           + Claude Code: close idle tabs, delete old chats
+#   mac-tune --caches           + package-manager caches and Docker junk
+#   mac-tune --trash            + Trash items older than --days
+#   mac-tune --settings         + opinionated Docker/VS Code/Cursor/browser settings
+#   mac-tune --startup          + disable known updater/adware LaunchAgents
+#   mac-tune --all              all of the above, closing every idle Claude tab
+#   mac-tune --only a,b         run only the listed steps
+#   mac-tune --claude-stop [N]  only close Claude tabs started N+ hours ago (6)
+#   mac-tune --days N           age threshold for logs, Trash, chats (default 7)
+#   mac-tune --idle-hours N     close Claude tabs idle for N+ hours (default 12)
+#
+# Steps: orphans claude-tabs spotlight claude-chats logs trash caches
+#        startup settings
+#
+# Never touched, whatever the flags:
+#   ~/.claude/projects/*/memory/   Claude's memory between sessions
+#   running Claude chats           their files stay; only idle tabs are closed,
+#                                  a working tab or one waiting for you never is
+#   Docker volumes                 your local databases live there
+#   project sources and git repositories
+#   running apps — browsers, IDEs, messengers
+
+set -uo pipefail
+
+VERSION=1.0.0
+
+[[ "$(uname -s)" == Darwin ]] || { echo "mac-tune: macOS only" >&2; exit 1; }
+# On a fresh Mac /usr/bin/python3 is a stub that opens an installer dialog
+PY=$(command -v python3 || true)
+if [[ -z "$PY" ]] || { [[ "$PY" == /usr/bin/python3 ]] && ! xcode-select -p >/dev/null 2>&1; }; then
+  echo "mac-tune: needs python3 — install it with: xcode-select --install" >&2
+  exit 1
+fi
+
+ALL_STEPS="orphans claude-tabs spotlight claude-chats logs trash caches startup settings"
+STEPS="orphans spotlight logs startup"
+DRY=0; DIAG=0; DAYS=7; IDLE_H=12; STOP_H=""; FIX_STARTUP=0; ONLY=""
+need_num(){ [[ "${1:-}" =~ ^[0-9]+$ ]] || { echo "mac-tune: $2 needs a number" >&2; exit 2; }; }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)   DRY=1 ;;
+    --diag)         DIAG=1; DRY=1 ;;
+    --claude)       STEPS="$STEPS claude-tabs claude-chats" ;;
+    --caches)       STEPS="$STEPS caches" ;;
+    --trash)        STEPS="$STEPS trash" ;;
+    --settings)     STEPS="$STEPS settings" ;;
+    --startup)      FIX_STARTUP=1 ;;
+    --all)          STEPS="$ALL_STEPS"; IDLE_H=0; FIX_STARTUP=1 ;;
+    --only)         ONLY="${2:-}"; shift ;;
+    --claude-stop)  STOP_H=6; [[ "${2:-}" =~ ^[0-9]+$ ]] && { STOP_H=$2; shift; } ;;
+    --days)         need_num "${2:-}" --days; DAYS=$2; shift ;;
+    --idle-hours)   need_num "${2:-}" --idle-hours; IDLE_H=$2; shift ;;
+    -V|--version)   echo "mac-tune $VERSION"; exit 0 ;;
+    -h|--help)      awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    *) echo "mac-tune: unknown flag: $1 (see --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+(( DAYS < 1 )) && DAYS=1
+[[ -n "$STOP_H" ]] && ONLY=claude-tabs
+if [[ -n "$ONLY" ]]; then
+  STEPS=${ONLY//,/ }
+  for s in $STEPS; do
+    [[ " $ALL_STEPS " == *" $s "* ]] || { echo "mac-tune: unknown step: $s (steps: $ALL_STEPS)" >&2; exit 2; }
+  done
+fi
+want(){ [[ " $STEPS " == *" $1 "* ]]; }
+
+B=$(tput bold 2>/dev/null||true); D=$(tput sgr0 2>/dev/null||true)
+G=$(tput setaf 2 2>/dev/null||true); Y=$(tput setaf 3 2>/dev/null||true)
+R=$(tput setaf 1 2>/dev/null||true)
+hdr(){ printf "\n%s== %s%s\n" "$B" "$1" "$D"; }
+act(){ if (( DRY )); then printf "   %s[dry]%s %s\n" "$Y" "$D" "$1"
+       else printf "   %s✓%s %s\n" "$G" "$D" "$1"; fi; }
+warn(){ printf "   %s⚠  %s%s\n" "$Y" "$1" "$D"; }
+crit(){ printf "   %s✖  %s%s\n" "$R" "$1" "$D"; }
+run(){ (( DRY )) || eval "$1" >/dev/null 2>&1; }
+mb(){ du -sm "$1" 2>/dev/null | cut -f1 || echo 0; }
+
+# Current is negative while discharging and positive while charging, so power
+# draw only makes sense on battery.
+watts(){ ioreg -rn AppleSmartBattery 2>/dev/null | python3 -c '
+import sys,re
+d=sys.stdin.read()
+try:
+    e=re.search(r"\"ExternalConnected\" = (Yes|No)",d)
+    if e and e.group(1)=="Yes": print("on AC"); raise SystemExit
+    a=int(re.search(r"\"Amperage\" = (\d+)",d).group(1)); a=a-2**64 if a>2**63 else a
+    v=int(re.search(r"\"Voltage\" = (\d+)",d).group(1))
+    print(f"{abs(a)*v/1e6:.1f} W")
+except SystemExit: pass
+except Exception: print("n/a")'; }
+
+# Roots searched for projects. Missing ones are skipped silently.
+DEV_ROOTS=("$HOME/Desktop" "$HOME/Documents" "$HOME/Developer" "$HOME/Projects"
+           "$HOME/projects" "$HOME/src" "$HOME/code" "$HOME/work" "$HOME/repos")
+# Folders that should be neither indexed nor watched.
+DEV_JUNK=(node_modules vendor .git target .venv venv __pycache__ .mypy_cache
+          .pytest_cache .gradle Pods .next .nuxt .svelte-kit dist build
+          .terraform .turbo .parcel-cache .angular DerivedData)
+
+FREED=0
+STEP=0
+step(){ STEP=$((STEP+1)); hdr "$STEP. $1"; }
+
+# Every Claude Code chat tab keeps its own ~200 MB process until the tab is
+# closed. Status and timestamps come from the ~/.claude/sessions registry.
+stop_claude_tabs(){ # $1=updatedAt (last activity) | startedAt (launch)  $2=hours
+G="$G" Y="$Y" D="$D" python3 - "$1" "$2" "$DRY" <<'PY'
+import os, sys, json, glob, time, signal, subprocess
+field, hours, dry = sys.argv[1], float(sys.argv[2]), sys.argv[3] == "1"
+mark = f"{os.environ['Y']}[dry]{os.environ['D']}" if dry else f"{os.environ['G']}✓{os.environ['D']}"
+reg = os.path.expanduser("~/.claude/sessions")
+if not os.path.isdir(reg):
+    print("   Claude Code session registry not found — skipping"); sys.exit()
+def ps(pid, col):
+    return subprocess.run(["ps", "-o", f"{col}=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.strip()
+# mac-tune started from a chat must not close that same chat
+mine, p = set(), os.getpid()
+while p > 1:
+    mine.add(p); p = int(ps(p, "ppid") or 1)
+now, n, rss, busy = time.time(), 0, 0, 0
+when = ("every idle tab" if hours == 0 else
+        f"idle for {hours:g}+ h" if field == "updatedAt" else f"started {hours:g}+ h ago")
+for f in glob.glob(f"{reg}/*.json"):
+    try: s = json.load(open(f))
+    except Exception: continue
+    pid = int(s.get("pid") or 0)
+    if pid <= 1 or pid in mine or s.get("kind") != "interactive":
+        continue
+    if (now - s.get(field, now * 1000) / 1000) / 3600 < hours:
+        continue
+    # the pid may belong to another process once the chat has exited
+    if "claude" not in ps(pid, "args"):
+        continue
+    # a working tab, or one waiting for your answer, is never closed
+    if s.get("status") != "idle":
+        busy += 1; continue
+    rss += int(ps(pid, "rss") or 0); n += 1
+    if not dry:
+        try: os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError: pass
+if n:
+    print(f"   {mark} closing tabs ({when}): {n}, ~{rss // 1024} MB of memory")
+    print("      the conversation is kept: reopen it from the chat history")
+else:
+    print(f"   no tabs to close ({when})")
+if busy:
+    print(f"   working or waiting for you — left alone: {busy}")
+PY
+}
+
+if [[ -z "$ONLY" ]]; then
+BEFORE_SWAP=$(sysctl -n vm.swapusage | sed 's/.*used = \([0-9.]*\)M.*/\1/')
+BEFORE_W=$(watts)
+fi
+
+(( DRY )) && printf "%s*** DRY RUN — nothing will be changed ***%s\n" "$Y" "$D"
+
+# ═════════════════════════════════════════════════════════════════════════════
+if [[ -z "$ONLY" ]]; then
+step "Diagnostics: what structurally burns resources"
+
+# --- iCloud dragging a dev tree around is the most expensive misconfiguration
+# on a Mac. The CloudDocs/Desktop folder outlives the setting, so read the
+# setting itself.
+icloud_desk=$(defaults read com.apple.finder FXICloudDriveDesktop 2>/dev/null || echo 1)
+if [[ "$icloud_desk" != "0" ]]; then
+  repos=0; sfiles=0; smb=0
+  for r in "$HOME/Desktop" "$HOME/Documents"; do
+    [[ -d "$r" ]] || continue
+    repos=$((repos + $(find "$r" -maxdepth 4 -type d -name .git -prune 2>/dev/null | wc -l | tr -d ' ')))
+    # Sync load grows with the number of files and with their size, not with
+    # the number of repositories.
+    sfiles=$((sfiles + $(find "$r" -type f 2>/dev/null | wc -l | tr -d ' ')))
+    smb=$((smb + $(mb "$r")))
+  done
+  sgb=$((smb / 1024))
+  if (( sfiles > 50000 || sgb > 20 )); then
+    crit "iCloud is syncing $sfiles files / ${sgb} GB from Desktop and Documents"
+    if (( sgb > 20 )); then
+      echo "      Largest:"
+      du -sm "$HOME/Desktop"/* 2>/dev/null | sort -rn | head -3 \
+        | awk '{printf "        %5.1f GB  %s\n", $1/1024, substr($0, index($0,$2))}'
+    fi
+    bc=$(ps -Ao %cpu,ucomm | awk '$2=="bird"{s+=$1} END{printf "%.0f", s+0}')
+    fc=$(ps -Ao %cpu,ucomm | awk '$2=="fileproviderd"{s+=$1} END{printf "%.0f", s+0}')
+    printf "      right now bird %s%% CPU, fileproviderd %s%% CPU\n" "$bc" "$fc"
+    printf "      Sync cannot exclude folders; the only fixes are:\n"
+    printf "        1) move projects to ~/Developer (that folder is not synced)\n"
+    printf "        2) System Settings -> [Apple ID] -> iCloud -> iCloud Drive ->\n"
+    printf "           Options -> turn off \"Desktop & Documents Folders\"\n"
+  elif (( repos > 0 )); then
+    warn "iCloud: $repos repositories, $sfiles files, ${sgb} GB — moderate load"
+    echo "      Keep dependencies and videos out of ~/Desktop and it stays that way."
+  else
+    echo "   iCloud: no repositories in synced folders ✓"
+  fi
+else
+  echo "   iCloud: Desktop sync is off ✓"
+fi
+
+# --- Runaway processes. Not killed: it may be a tab or a build with your work.
+hot=$(ps -Ao %cpu,rss,pid,ucomm -r | awk 'NR>1 && $1+0 > 25 {
+        printf "%s%% CPU, %d MB — %s (pid %s)\n", $1, $2/1024, $4, $3 }' | head -5)
+if [[ -n "$hot" ]]; then
+  while IFS= read -r l; do warn "running hot: $l"; done <<< "$hot"
+  echo "      Deliberately not killed — it may be a tab or a build with your work."
+fi
+
+# --- Uptime: Mach port leaks in system daemons
+UP=$(uptime | sed -n 's/.*up \([0-9]*\) day.*/\1/p')
+if [[ -n "$UP" ]] && (( UP > 14 )); then
+  warn "uptime $UP days — WindowServer/coreaudiod leak ports, time to reboot"
+fi
+
+if (( DIAG )); then
+  hdr "Diagnostics only"
+  printf "   swap %s MB, load %s\n" "$BEFORE_SWAP" "$(uptime|sed 's/.*load averages*: //')"
+  printf "   power draw %s\n" "$BEFORE_W"
+  exit 0
+fi
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+if want orphans; then
+step "Hung and orphaned helper processes"
+# Only processes with PPID=1 — the ones that lost their parent. A live app's
+# process always hangs off its parent and never matches.
+killed=0
+kill_orphan(){ # $1=regex  $2=min age (h)  $3=description
+  local pid etime hours
+  while read -r pid etime; do
+    [[ -z "$pid" ]] && continue
+    hours=$(printf '%s' "$etime" | awk -F'[-:]' '{
+      if (NF==4) print $1*24+$2; else if (NF==3) print $1; else print 0 }')
+    (( hours < $2 )) && continue
+    act "$3 — pid $pid (age ${hours}h)"
+    run "kill -9 $pid"; killed=$((killed+1))
+  done < <(ps -Ao pid,ppid,etime,args | awk -v p="$1" '$2==1 && $0 ~ p {print $1, $3}')
+}
+kill_orphan 'docker stats'                        1 "zombie docker stats"
+kill_orphan '@vscode/ripgrep/bin/rg|/rg --files'  1 "hung IDE search (ripgrep)"
+kill_orphan 'chrome_crashpad_handler'            72 "orphaned crashpad"
+kill_orphan 'npm exec .*mcp|node .*[-_]mcp'      24 "orphaned MCP server"
+kill_orphan 'esbuild --service|tsserver\.js'     24 "orphaned esbuild/tsserver"
+kill_orphan 'watchman|fswatch'                   24 "orphaned file watcher"
+pgrep -qf '/Applications/Cursor.app/Contents/MacOS/Cursor' \
+  || kill_orphan 'cursorsandbox' 24 "cursorsandbox without Cursor"
+(( killed == 0 )) && echo "   nothing found"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+if want claude-tabs; then
+  if [[ -n "$STOP_H" ]]; then
+    step "Claude Code tabs started more than $STOP_H h ago"
+    stop_claude_tabs startedAt "$STOP_H"
+  else
+    step "Idle Claude Code tabs"
+    stop_claude_tabs updatedAt "$IDLE_H"
+  fi
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+if want spotlight; then
+step "Spotlight: markers on dev folders"
+# npm/composer install wipe .metadata_never_index, so the step is repeatable.
+NAMEARGS=(); for j in "${DEV_JUNK[@]}"; do NAMEARGS+=(-name "$j" -o); done
+unset 'NAMEARGS[${#NAMEARGS[@]}-1]'
+n=0
+for root in "${DEV_ROOTS[@]}"; do
+  [[ -d "$root" ]] || continue
+  while read -r d; do
+    [[ -z "$d" || -f "$d/.metadata_never_index" ]] && continue
+    s=$(mb "$d"); (( s < 20 )) && continue
+    act "$s MB — ${d#"$HOME"/}"
+    run "touch '$d/.metadata_never_index'"; n=$((n+1))
+  done < <(find "$root" -maxdepth 6 -type d \( "${NAMEARGS[@]}" \) -prune 2>/dev/null)
+done
+(( n == 0 )) && echo "   every dev folder is already marked"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+if want claude-chats; then
+step "Claude Code chats older than $DAYS days — deleted whole, no archive"
+CHAT_MB=$(mktemp)
+G="$G" Y="$Y" D="$D" python3 - "$DAYS" "$DRY" "$CHAT_MB" <<'PY'
+import os, sys, json, glob, time, shutil
+days, dry, out = int(sys.argv[1]), sys.argv[2] == "1", sys.argv[3]
+mark = f"{os.environ['Y']}[dry]{os.environ['D']}" if dry else f"{os.environ['G']}✓{os.environ['D']}"
+H = os.path.expanduser("~"); C = f"{H}/.claude"; ROOT = f"{C}/projects"
+CUT = time.time() - days * 86400
+if not os.path.isdir(C):
+    print("   ~/.claude not found — skipping"); open(out, "w").write("0\n"); sys.exit()
+def newest(p):
+    m = os.path.getmtime(p)
+    for dp, _, fs in os.walk(p):
+        for f in fs:
+            try: m = max(m, os.path.getmtime(os.path.join(dp, f)))
+            except OSError: pass
+    return m
+def size(p):
+    if os.path.isfile(p): return os.path.getsize(p)
+    t = 0
+    for dp, _, fs in os.walk(p):
+        for f in fs:
+            try: t += os.path.getsize(os.path.join(dp, f))
+            except OSError: pass
+    return t
+def alive(pid):
+    try: os.kill(pid, 0); return True
+    except ProcessLookupError: return False
+    except PermissionError: return True
+# Running chats are kept, however long ago they were last used
+live = set()
+for f in glob.glob(f"{C}/sessions/*.json"):
+    try: s = json.load(open(f))
+    except Exception: continue
+    if int(s.get("pid") or 0) > 1 and alive(int(s["pid"])): live.add(s.get("sessionId"))
+# One chat is scattered: <id>.jsonl and <id>/ where it started, <id>/ in every
+# project folder it moved to, plus file-history/<id> and session-env/<id>
+chats = {}
+def add(uid, p):
+    if len(uid) == 36 and uid.count("-") == 4: chats.setdefault(uid, []).append(p)
+projects = [os.path.join(ROOT, x) for x in os.listdir(ROOT)] if os.path.isdir(ROOT) else []
+projects = [pd for pd in projects if os.path.isdir(pd)]
+for pd in projects:
+    for e in os.listdir(pd):
+        if e != "memory": add(e[:-6] if e.endswith(".jsonl") else e, os.path.join(pd, e))
+for base in ("file-history", "session-env"):
+    if os.path.isdir(f"{C}/{base}"):
+        for e in os.listdir(f"{C}/{base}"): add(e, f"{C}/{base}/{e}")
+old, n, rest = [], 0, 0
+for uid, ps in chats.items():
+    if uid in live: continue
+    try:
+        if max(newest(p) for p in ps) >= CUT: continue
+    except OSError: continue
+    old += ps
+    # without a transcript only the leftovers of a long-deleted chat remain
+    if any(p.endswith(".jsonl") for p in ps): n += 1
+    else: rest += 1
+# SAFETY: memory never makes it into the list
+if any("/memory" in p for p in old):
+    print("   ✖  STOP: memory ended up in the list — step cancelled"); sys.exit()
+gone = set(old)
+empty = [pd for pd in projects if all(os.path.join(pd, e) in gone for e in os.listdir(pd))]
+# Archives written by earlier versions of this script
+arch = glob.glob(f"{H}/Documents/claude-chats-archive-*.tar.gz")
+hf, keep, drop, raw = f"{C}/history.jsonl", [], 0, b""
+if os.path.isfile(hf):
+    raw = open(hf, "rb").read()
+    for line in raw.splitlines(keepends=True):
+        try: t = json.loads(line).get("timestamp", 0) / 1000
+        except Exception: t = time.time()
+        if t < CUT: drop += 1
+        else: keep.append(line)
+mb = (sum(size(p) for p in old) + sum(os.path.getsize(a) for a in arch)) / 1048576
+if n:     print(f"   {mark} deleting chats: {n}")
+if rest:  print(f"   {mark} leftovers of chats deleted earlier: {rest}")
+if empty: print(f"   {mark} empty project folders: {len(empty)}")
+if arch:  print(f"   {mark} old chat archives: {len(arch)}")
+if drop:  print(f"   {mark} prompt history: dropping {drop} entries")
+if not (n or rest or empty or arch or drop): print("   nothing to delete")
+elif mb >= 1: print(f"      ~{mb:.0f} MB")
+if not dry:
+    for p in old + arch:
+        try: shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+        except OSError: pass
+    for pd in empty:
+        try: os.rmdir(pd)
+        except OSError: pass
+    if drop:
+        # other chats may append a prompt meanwhile: pick up the tail
+        tmp = hf + ".mac-tune"
+        with open(tmp, "wb") as f:
+            f.writelines(keep)
+            with open(hf, "rb") as cur:
+                cur.seek(len(raw)); f.write(cur.read())
+        os.chmod(tmp, os.stat(hf).st_mode & 0o777)
+        os.replace(tmp, hf)
+open(out, "w").write(f"{0 if dry else int(mb)}\n")
+PY
+m=0; read -r m < "$CHAT_MB"; FREED=$((FREED + ${m:-0}))
+rm -f "$CHAT_MB"
+
+for dir in "$HOME/.claude/debug" "$HOME/.claude/shell-snapshots" "$HOME/.claude/backups"; do
+  [[ -d "$dir" ]] || continue
+  c=$(find "$dir" -mindepth 1 -maxdepth 1 -mtime +"$DAYS" 2>/dev/null | wc -l | tr -d ' ')
+  (( c == 0 )) && continue
+  act "$(basename "$dir"): deleting $c old items"
+  run "find '$dir' -mindepth 1 -maxdepth 1 -mtime +$DAYS -exec rm -rf {} +"
+done
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+prune(){ # $1=path $2=description
+  [[ -d "$1" ]] || return
+  local c; c=$(find "$1" -mindepth 1 -maxdepth 1 -mtime +"$DAYS" 2>/dev/null | wc -l | tr -d ' ')
+  (( c == 0 )) && return
+  pruned=1
+  act "$2: $c items"
+  run "find '$1' -mindepth 1 -maxdepth 1 -mtime +$DAYS -exec rm -rf {} +"
+}
+if want logs; then
+step "Logs and crash reports older than $DAYS days"
+pruned=0
+prune "$HOME/Library/Logs"                              "app logs"
+prune "$HOME/Library/Logs/DiagnosticReports"            "crash reports"
+prune "$HOME/Library/Application Support/CrashReporter" "crash reporter"
+prune "$HOME/Library/Caches/com.apple.dt.Xcode/Logs"    "Xcode logs"
+(( pruned )) || echo "   nothing older than $DAYS days"
+fi
+if want trash; then
+step "Trash items older than $DAYS days"
+pruned=0
+prune "$HOME/.Trash" "Trash"
+(( pruned )) || echo "   nothing older than $DAYS days"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+if want caches; then
+step "Dev caches (re-downloaded on the next build)"
+deep_clean(){ # $1=path $2=description
+  [[ -d "$1" ]] || return
+  local s; s=$(mb "$1"); (( s < 50 )) && return
+  act "$2 — freeing $s MB"
+  run "find '$1' -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
+  (( DRY )) || FREED=$((FREED + s))
+}
+deep_clean "$HOME/.npm/_cacache"                          "npm cache"
+deep_clean "$HOME/Library/Caches/Yarn"                    "Yarn cache"
+deep_clean "$HOME/Library/pnpm/store"                     "pnpm store"
+deep_clean "$HOME/.composer/cache"                        "Composer cache"
+deep_clean "$HOME/.cache/composer"                        "Composer cache (xdg)"
+deep_clean "$HOME/Library/Caches/pip"                     "pip cache"
+deep_clean "$HOME/Library/Caches/go-build"                "Go build cache"
+deep_clean "$HOME/.cargo/registry/cache"                  "Cargo cache"
+deep_clean "$HOME/.gradle/caches"                         "Gradle cache"
+deep_clean "$HOME/Library/Developer/Xcode/DerivedData"    "Xcode DerivedData"
+deep_clean "$HOME/Library/Caches/CocoaPods"               "CocoaPods cache"
+deep_clean "$HOME/Library/Caches/Homebrew"                "Homebrew cache"
+
+# Docker: dangling images, build cache and stopped containers only.
+# Volumes are never touched — local databases live there.
+if docker info >/dev/null 2>&1; then
+  docker system df 2>/dev/null | sed 's/^/      /'
+  act "docker: dangling images, build cache, stopped containers"
+  echo "      volumes are left alone — local databases live there"
+  run "docker image prune -f"
+  run "docker builder prune -f"
+  run "docker container prune -f"
+else
+  echo "   Docker is not running — skipping"
+fi
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+if want startup; then
+step "Startup items"
+LI=$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null)
+if [[ -n "${LI// /}" ]]; then
+  warn "login items: $LI"
+  echo "      remove one: osascript -e 'tell application \"System Events\" to delete login item \"NAME\"'"
+else
+  echo "   login items: none ✓"
+fi
+JUNK='keystone|GoogleUpdater|touchvpn|northghost|vpnify|Cleaner|MacKeeper|Genieo'
+found_la=0
+for f in "$HOME/Library/LaunchAgents"/*.plist /Library/LaunchAgents/*.plist; do
+  [[ -e "$f" ]] || continue
+  found_la=1; base=$(basename "$f")
+  if [[ ! "$base" =~ $JUNK ]]; then
+    warn "unfamiliar LaunchAgent: $base — check it yourself"
+  elif [[ "$f" != "$HOME"/* ]]; then
+    warn "known junk: $f — system-wide, remove it with sudo"
+  elif (( FIX_STARTUP )); then
+    act "disabling: $base"
+    run "launchctl bootout gui/$UID '$f'"
+    run "mkdir -p '$HOME/Library/LaunchAgents/disabled-by-mac-tune'"
+    run "mv '$f' '$HOME/Library/LaunchAgents/disabled-by-mac-tune/'"
+  else
+    warn "known junk: $base — disable it with mac-tune --startup"
+  fi
+done
+(( found_la == 0 )) && echo "   no third-party LaunchAgents ✓"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+if want settings; then
+step "Docker, VS Code, Cursor and browser settings"
+DS="$HOME/Library/Group Containers/group.com.docker/settings-store.json"
+if [[ -f "$DS" ]]; then
+  python3 - "$DS" "$DRY" <<'PY'
+import json, os, shutil, sys
+f, dry = sys.argv[1], sys.argv[2] == "1"
+try: d = json.load(open(f))
+except Exception: print("   Docker: settings-store.json does not parse — skipping"); sys.exit()
+want = {"KubernetesEnabled": False, "AnalyticsEnabled": False,
+        "ShowAnnouncementNotifications": False, "OpenUIOnStartupDisabled": True,
+        "UseResourceSaver": True}
+bad = {k: v for k, v in want.items() if d.get(k) != v}
+if not bad: print("   Docker: Kubernetes and analytics are off ✓"); sys.exit()
+for k, v in bad.items(): print(f"   {'[dry] ' if dry else '✓ '}Docker {k}: {d.get(k)} → {v}")
+if not dry:
+    shutil.copy2(f, f + ".mac-tune.bak")
+    d.update(bad)
+    json.dump(d, open(f + ".tmp", "w"), indent=2); os.replace(f + ".tmp", f)
+    print("   restart Docker Desktop to apply (backup: settings-store.json.mac-tune.bak)")
+PY
+fi
+for VS in "$HOME/Library/Application Support/Code/User/settings.json" \
+          "$HOME/Library/Application Support/Cursor/User/settings.json"; do
+  [[ -f "$VS" ]] || continue
+  python3 - "$VS" "$DRY" <<'PY'
+import json, os, re, shutil, sys
+f, dry = sys.argv[1], sys.argv[2] == "1"
+name = os.path.basename(os.path.dirname(os.path.dirname(f)))
+def strip_jsonc(s):
+    # drop // and /* */ comments outside strings, then trailing commas
+    out, i, quoted = [], 0, False
+    while i < len(s):
+        c = s[i]
+        if quoted:
+            out.append(c)
+            if c == "\\": out.append(s[i + 1:i + 2]); i += 2; continue
+            if c == '"': quoted = False
+        elif c == '"': quoted = True; out.append(c)
+        elif s.startswith("//", i):
+            j = s.find("\n", i); i = len(s) if j < 0 else j; continue
+        elif s.startswith("/*", i):
+            j = s.find("*/", i + 2); i = len(s) if j < 0 else j + 2; continue
+        else: out.append(c)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+text = open(f).read()
+try: d, plain = json.loads(text), True
+except ValueError:
+    try: d, plain = json.loads(strip_jsonc(text)), False
+    except ValueError: print(f"   {name}: settings.json does not parse — skipping"); sys.exit()
+watch = dict(d.get("files.watcherExclude") or {})
+watch.update({f"**/{x}/**": True for x in
+    ["node_modules", "vendor", ".git", "target", ".venv", "__pycache__", "dist", "build",
+     ".next", ".gradle", "Pods", "storage/logs", "storage/framework", "coverage"]})
+want = {
+ "files.watcherExclude": watch,
+ "search.followSymlinks": False, "npm.autoDetect": "off", "task.autoDetect": "off",
+ "telemetry.telemetryLevel": "off", "workbench.enableExperiments": False,
+ "extensions.autoCheckUpdates": False, "git.autofetch": False,
+}
+bad = {k: v for k, v in want.items() if d.get(k) != v}
+if not bad: print(f"   {name}: watcher and telemetry are set ✓"); sys.exit()
+if not plain:
+    # rewriting would lose the user's comments
+    print(f"   {name}: settings.json has comments — not rewriting it; set by hand:")
+    for k in bad: print(f"      {k}")
+    sys.exit()
+for k in bad: print(f"   {'[dry] ' if dry else '✓ '}{name}: {k}")
+if not dry:
+    shutil.copy2(f, f + ".mac-tune.bak")
+    d.update(bad)
+    json.dump(d, open(f + ".tmp", "w"), indent=2, ensure_ascii=False); os.replace(f + ".tmp", f)
+    print(f"   restart {name} to apply (backup: settings.json.mac-tune.bak)")
+PY
+done
+# Browsers: don't linger in the background once the windows are closed
+for b in com.google.Chrome com.brave.Browser; do
+  [[ "$(defaults read "$b" BackgroundModeEnabled 2>/dev/null)" == "0" ]] && continue
+  act "$b: turning off background mode"
+  run "defaults write $b BackgroundModeEnabled -bool false"
+done
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+[[ -n "$ONLY" ]] && exit 0
+hdr "Summary"
+python3 - <<'PY'
+import subprocess, collections, re
+ps = subprocess.run(["ps", "-Ao", "rss,args"], capture_output=True, text=True).stdout
+g = collections.Counter()
+# Claude before VS Code: a chat tab's binary lives inside .vscode/extensions
+pats = [("Docker", r"Docker|com\.docker"), ("Claude", r"native-binary/claude|/bin/claude\b"),
+        ("VS Code", r"Visual Studio Code|Code Helper|\.vscode/ext"),
+        ("Cursor", r"/Cursor\.app"), ("Chrome", r"Google Chrome"), ("Brave", r"Brave Browser"),
+        ("Firefox", r"[Ff]irefox"), ("Slack", r"Slack"), ("Telegram", r"Telegram")]
+for line in ps.splitlines()[1:]:
+    try: rss, args = line.strip().split(None, 1)
+    except ValueError: continue
+    for name, p in pats:
+        if re.search(p, args): g[name] += int(rss); break
+for name, v in g.most_common():
+    if v > 51200: print(f"   {name:<10} {v / 1024:6.0f} MB")
+PY
+printf "   ─────────────────────\n"
+printf "   swap        %s → %s MB\n" "$BEFORE_SWAP" \
+  "$(sysctl -n vm.swapusage | sed 's/.*used = \([0-9.]*\)M.*/\1/')"
+printf "   power draw  %s → %s\n" "$BEFORE_W" "$(watts)"
+printf "   load        %s\n" "$(uptime | sed 's/.*load averages*: //')"
+(( FREED > 0 )) && printf "   freed       ~%s MB\n" "$FREED"
+(( DRY )) && printf "\n   Nothing was changed. Run without -n to apply.\n"
+want caches || printf "\n   Dev caches and Docker junk untouched: %smac-tune --caches%s\n" "$B" "$D"
+exit 0

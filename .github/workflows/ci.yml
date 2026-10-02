@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: brew install shellcheck
+      - name: Lint
+        run: shellcheck mac-tune tests/run.sh
+      - name: Test with the system bash 3.2
+        run: /bin/bash tests/run.sh
+        env:
+          CI: "1"
